@@ -1,11 +1,3 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
 
 import os, sys
 import glob
@@ -19,75 +11,19 @@ from Utils import *
 import pandas
 from pathlib import Path
 from core.foundation_stereo import *
-
-
-def read_timestamps_and_paths(cam_dir):
-    df = pandas.read_csv(Path(cam_dir) / "data.csv")
-    timestamps = df.values[:, 0]
-    paths = df.values[:, 1]
-    return timestamps, paths
-
-
-def find_image_pairs(left_dir, right_dir):
-    """Find matching left and right image pairs by index (assumes same order)"""
-
-    # left_pattern = os.path.join(left_dir, "**/*.jpg")
-    # right_pattern = os.path.join(right_dir, "**/*.jpg")
-
-    # left_files = sorted(glob.glob(left_pattern, recursive=True))
-    # right_files = sorted(glob.glob(right_pattern, recursive=True))
-    left_timestamps, left_paths = read_timestamps_and_paths(left_dir)
-    right_timestamps, right_paths = read_timestamps_and_paths(right_dir)
-
-    print(f"Found {len(left_paths)} left images and {len(right_paths)} right images")
-
-    sampled_left_timestamps = [left_timestamps[0]]
-    sampled_indices = [0]
-    i = 1
-    while i < len(left_timestamps) - 1:
-        while (i < len(left_timestamps) - 1) and np.abs(
-            left_timestamps[i] - sampled_left_timestamps[-1]
-        ) < 1e9:
-            i += 1
-        sampled_left_timestamps.append(left_timestamps[i])
-        sampled_indices.append(i)
-
-    # Match by index
-    pairs = []
-
-    for i in sampled_indices:
-        left_file = left_paths[i]
-        left_ts = int(left_timestamps[i])
-        # Find closest right file by timestamp
-        right_file_idx = np.argmin(np.abs(right_timestamps - left_ts))
-        if np.abs(right_timestamps[right_file_idx] - left_ts) > 6e7:  # 60 ms
-            continue
-
-        right_file = right_paths[right_file_idx]
-        # Use left image basename as identifier
-        basename = str(left_ts)
-        pairs.append(
-            (
-                Path(left_dir) / "data" / Path(left_file),
-                Path(right_dir) / "data" / Path(right_file),
-                basename,
-            )
-        )
-
-    return pairs
-
+import cv2
 
 if __name__ == "__main__":
     code_dir = os.path.dirname(os.path.realpath(__file__))
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--left_file",
+        "--left_file_dir",
         required=True,
         type=str,
         help="Directory containing left camera images",
     )
     parser.add_argument(
-        "--right_file",
+        "--right_file_dir",
         required=True,
         type=str,
         help="Directory containing right camera images",
@@ -112,6 +48,18 @@ if __name__ == "__main__":
         help="the directory to save results",
     )
     parser.add_argument(
+        "--ply_out_dir",
+        default="",
+        type=str,
+        help="the directory to save resulting point clouds",
+    )
+    parser.add_argument(
+        "--out_vis_dir",
+        default="",
+        type=str,
+        help="the directory to save resulting visualizations",
+    )
+    parser.add_argument(
         "--scale",
         default=1,
         type=float,
@@ -124,7 +72,7 @@ if __name__ == "__main__":
         help="hierarchical inference (only needed for high-resolution images (>1K))",
     )
     parser.add_argument(
-        "--z_far", default=45, type=float, help="max depth to clip in point cloud"
+        "--z_far", default=20, type=float, help="max depth to clip in point cloud"
     )
     parser.add_argument(
         "--valid_iters",
@@ -197,21 +145,38 @@ if __name__ == "__main__":
                 .reshape(3, 3)
             )
             baseline = float(lines[1])
+            
+    left_file_dir = Path(args.left_file_dir)
+    left_timestamps = []
+    for child in left_file_dir.iterdir():
+        if child.suffix == '.jpg':
+            left_timestamps.append(int(child.stem))
+    right_file_dir = Path(args.right_file_dir)
+    
+    output_dir = Path(args.out_dir)
+    output_dir.mkdir(exist_ok=True)
+    is_ply_output = len(args.ply_out_dir) > 0
+    if is_ply_output:
+        ply_output_dir = Path(args.ply_out_dir)
+        ply_output_dir.mkdir(exist_ok=True)
+        
+    is_save_vis = len(args.out_vis_dir) > 0
+    if is_save_vis:
+        Path(args.out_vis_dir).mkdir(exist_ok=True)
+        
+    print(f'To process: {len(left_timestamps)}')
+    
+    black_mask = None
 
-    # Process each image pair
-#   for idx, (left_file, right_file, basename) in tqdm(enumerate(image_pairs)):
-    if True:
-        left_file = args.left_file
-        right_file = args.right_file
-        basename = 'processed'
+    for left_ts in left_timestamps:
+        left_file = left_file_dir / f'{left_ts}.jpg'
+        right_file = right_file_dir / f'{left_ts}.jpg'        
         # Create output directory for this pair
         # pair_out_dir = os.path.join(args.out_dir, f"{basename}")
         # os.makedirs(pair_out_dir, exist_ok=True)
-        if (f"{basename}.npy" in os.listdir(args.out_dir)) or (
-            f"{basename}.ply" in os.listdir(args.out_dir)
-        ):
-            logging.info(f"Skipping {basename}, already processed")
-#            continue
+        if (f"{left_ts}.npy" in os.listdir(args.out_dir)):
+            logging.info(f"Skipping {left_ts}, already processed")
+            continue
 
         img0 = imageio.imread(left_file)
         img1 = imageio.imread(right_file)
@@ -240,9 +205,18 @@ if __name__ == "__main__":
                 )
         disp = padder.unpad(disp.float())
         disp = disp.data.cpu().numpy().reshape(H, W)
+        
+        if black_mask is None:
+            black_mask = (img0_ori[:, :, 0] == 0)
+            kernel = np.ones((20,20),np.uint8)
+            dil_mask = cv2.dilate(black_mask.astype(np.uint8) * 255,kernel,iterations = 1)
+            black_mask = dil_mask>0
+        print(f'Black mask {np.sum(black_mask)}')
+        disp[black_mask] = np.inf
+        
         vis = vis_disparity(disp)
-        vis = np.concatenate([img0_ori, vis], axis=1)        
-
+        vis = np.concatenate([img0_ori, vis], axis=1)
+        
         if args.remove_invisible:
             yy, xx = np.meshgrid(
                 np.arange(disp.shape[0]), np.arange(disp.shape[1]), indexing="ij"
@@ -253,6 +227,12 @@ if __name__ == "__main__":
 
         K[:2] *= scale
         depth = K[0, 0] * baseline / disp
+        
+        np.save(Path(args.out_dir) / f"{left_ts}.npy", depth)
+        
+                        
+        if is_save_vis:
+            imageio.imwrite(Path(args.out_vis_dir) / f"{left_ts}.png", vis)
 
         if args.get_pc:
             # np.save(f"{args.out_dir}/{basename}", depth)
@@ -273,11 +253,9 @@ if __name__ == "__main__":
                 )
                 inlier_cloud = pcd.select_by_index(ind)
                 o3d.io.write_point_cloud(
-                    Path(args.out_dir) / f"{basename}.ply", inlier_cloud
+                    Path(args.ply_out_dir) / f"{left_ts}.ply", inlier_cloud
                 )
-                pcd = inlier_cloud
             else:
-                o3d.io.write_point_cloud(Path(args.out_dir) / f"{basename}.ply", pcd)
+                o3d.io.write_point_cloud(Path(args.ply_out_dir) / f"{left_ts}.ply", pcd)
 
-        else:
-            np.save(Path(args.out_dir) / f"{basename}.npy", depth)
+
